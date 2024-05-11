@@ -7,7 +7,10 @@
 
 function tmux_ws_select() {
 	function find_config_files() {
-		if ! find "${PROJECT_CFG_DIR}" -type f -print; then
+		if ! [[ -d "${PROJECT_CFG_DIR}" ]]; then
+			return 1
+		fi
+		if ! find -L "${PROJECT_CFG_DIR}/" -type f -print; then
 			return 1
 		fi
 		return 0
@@ -136,6 +139,10 @@ function tmux_ws_select() {
 	local PROJECT_CONFIG_FILES
 	declare -A PROJECT_PATHS
 	declare -A PROJECT_CONFIG_FILES
+
+	if [[ -L ${PROJECT_CFG_DIR} ]]; then
+		PROJECT_CFG_DIR="$(readlink -f "${PROJECT_CFG_DIR}")"
+	fi
 
 	if ! SETUP_ENVIRONMENT; then
 		return 1
