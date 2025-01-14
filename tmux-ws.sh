@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 
-#
-# Command to run on repeat during testing
-#  fdfind . | entr -cp tmux-ws.sh
-#
+set -o pipefail
+set -o errexit
+set -o nounset
+
+
+EXIT_CODE_READ_NAME=10
+EXIT_CODE_READ_PATH=11
 
 function tmux_ws_select() {
 	function find_config_files() {
@@ -21,14 +24,14 @@ function tmux_ws_select() {
 		if ! readarray -t config_files < <(find_config_files); then
 			return 1
 		fi
-
+		
 		local config_file
 		for config_file in "${config_files[@]}"; do
-			if ! local project_name="$(jq .projectName -r "${config_file}")"; then
-				return 1
+			if ! local project_name="$(yq ".name" -r "${config_file}")"; then
+				return ${EXIT_CODE_READ_NAME:-1}
 			fi
-			if ! local project_path="$(jq .projectPath -r "${config_file}")"; then
-				return 1
+			if ! local project_path="$(yq ".path" -r "${config_file}")"; then
+				return ${EXIT_CODE_READ_PATH:-1}
 			fi
 			PROJECTS+=("${project_name}")
 			PROJECT_PATHS["${project_name}"]="${project_path}"
@@ -43,6 +46,7 @@ function tmux_ws_select() {
 		for project_name in "${PROJECTS[@]}"; do
 			printf 'Debugging project "%s"\n' "${project_name}"
 			printf '\tPath: %s\n' "${PROJECT_PATHS["${project_name}"]}"
+			printf 'add to fzf loop %s\n' "${project_name}" >/dev/stderr
 			printf '\tConfig %s\n' "${PROJECT_CONFIG_FILES[${project_name}]}"
 			printf '\n'
 		done
@@ -51,6 +55,7 @@ function tmux_ws_select() {
 	}
 
 	function preview_project() {
+
 		if [[ ${#} -ne 1 ]]; then
 			printf 'No project selected for preview'
 			return 1
@@ -59,9 +64,8 @@ function tmux_ws_select() {
 		local project_name="${1}" && shift
 		local project_config_file="${PROJECT_CONFIG_FILES["${project_name}"]}"
 		local project_path="${PROJECT_PATHS["${project_name}"]}"
-		local project_path_to_print="$(echo $project_path | rg -o '([^/]+/){0,2}/?$')"
-		printf '%s\n' "${project_name}"
-		printf '%s\n' "${project_path_to_print}"
+		printf 'Name: %s\n' "${project_name}"
+		printf 'Path: %s\n' "${project_path}"
 		if [[ -d ${project_path}/.git ]]; then
 			local git_branch="$(git -C "${project_path/.git/}" rev-parse --abbrev-ref HEAD)"
 			printf 'Branch %s\n' "${git_branch}"
@@ -70,25 +74,72 @@ function tmux_ws_select() {
 
 		return 0
 	}
+	function prompt_bool(){
+		local prompt="${1:-"?"}"
+		local result=''
+		while ! echo "${result}" | rg -i '^(y(es)?|no?)$' 1> /dev/null 2> /dev/null
 
+		do
+			read -p "${prompt} " result
+		done
+
+		if echo "${result}" | rg -i '^y' 1> /dev/null 2> /dev/null
+
+		then
+			return 0
+		fi
+		return 1
+	}
+
+	function create_new_project(){
+		project_dir="$(pwd | sd "$HOME" '$$HOME')"
+
+		file_safe_name="$(printf '%s' "${project_name}"\
+			| sd '\s' '-'\
+			| sd '[$+()\[\]+%~#&\n\r]' '').yml"
+
+		if test "${file_safe_name}" = ".yml"
+		then
+			printf 'No file name!\n' > /dev/stderr
+			return 1
+		elif test -f "${PROJECT_CFG_DIR}/${file_safe_name}"
+		then
+			printf '%s already exists!\n' "${file_safe_name}" > /dev/stderr
+			return 1
+		fi
+		printf 'You entered: "%s"\n' "${project_name}"
+		printf 'File name: %s\n' "${file_safe_name}"
+		
+		if ! prompt_bool 'Ok?'
+		then
+			printf 'Better luck next time!\n'
+			return 0
+		fi
+		
+		FULL_PATH="${PROJECT_CFG_DIR}/${file_safe_name}"
+		touch "${FULL_PATH}"
+		local set_name="$(printf '.name = "%s"' "${project_name}")"
+		local set_dir="$(printf '.path = "%s"' "${project_dir}")"
+		yq "${set_name}" -i "${FULL_PATH}"
+		yq "${set_dir}" -i "${FULL_PATH}"
+		return 0
+	}
 	function select_project() {
 		local project_name
 		local selected_project
 		if ! selected_project="$(
 			for project_name in "${PROJECTS[@]}"; do
 				printf '%s\n' "${project_name}"
-			done |
-				sort |
-				fzf --no-multi \
+			done | sort | fzf --no-multi \
 					--prompt='project> ' \
 					--info=hidden \
 					--margin=1 \
 					--layout=reverse \
-					--border \
 					--preview="$0 -p {}" \
-					--preview-window="right:70%:wrap:hidden" \
+					--border \
+					--preview-window="right:70%:wrap" \
 					--bind 'ctrl-p:toggle-preview'
-			#--height=100 \
+					#--height=100 \
 		)"; then
 			return 1
 		fi
@@ -103,11 +154,15 @@ function tmux_ws_select() {
 		fi
 		local project_name="${1}"
 		local project_path="${PROJECT_PATHS["${project_name}"]}"
+		local real_path="$(echo ${project_path} | envsubst)"
 
-		#printf 'the project name is %s, btw\n' "${project_name}"
-		#2>/dev/stderr
+		if ! test -d "${real_path}"
+		then
+			printf 'Directory %s does not exist.' "${real_path}" > /dev/stderr
+			return 1
+		fi
 		if ! tmux has-session -t="${project_name}" 2>/dev/null; then
-			if ! tmux new-session -c "${project_path}" -s "${project_name}" -d; then
+			if ! tmux new-session -c "${real_path}" -s "${project_name}" -d; then
 				return 1
 			fi
 		fi
@@ -128,6 +183,7 @@ function tmux_ws_select() {
 		printf '\n'
 		printf '  -p "Project Name"       Generate the preview pane for fzf\n'
 		printf '  -s                      Select a project from a dropdown\n'
+		printf '  -c					  Create a new workspace for the current directory\n'
 		printf '  -h                      Print the help menu\n'
 		return 0
 	}
@@ -149,9 +205,10 @@ function tmux_ws_select() {
 	fi
 	# If a subcommand is requested, run that
 	local option
-	while getopts "sp:h" option; do
+	while getopts "sp:hc" option; do
 		case "${option}" in
 		p)
+			EXTRA_DEBUG_MODE=0
 			if ! preview_project "${OPTARG}"; then
 				return 1
 			fi
@@ -162,6 +219,13 @@ function tmux_ws_select() {
 				return 1
 			fi
 			if ! ensure_session_exists "${selected_project}"; then
+				return 1
+			fi
+			return 0
+			;;
+		c)
+			if ! create_new_project;
+			then
 				return 1
 			fi
 			return 0
